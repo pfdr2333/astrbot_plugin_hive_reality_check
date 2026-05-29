@@ -2,6 +2,10 @@
 
 这是一个 AstrBot 插件，为 LLM 注册 `check_media_authenticity_hive` 工具，用于核查当前消息或引用消息中的媒体真实性。
 
+## 例子
+<img width="761" height="675" alt="image" src="https://github.com/user-attachments/assets/06b76580-223f-41a2-a74b-77ddea28ac8f" />
+
+
 ## 特性
 
 - 只在用户明确询问“真实性 / 是否 AI 生成 / deepfake / 真假 / 伪造 / 合成”等问题时才应调用工具。
