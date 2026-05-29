@@ -1,0 +1,43 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "是否启用 Hive 真实性核查插件。",
+    "default": true
+  },
+  "hive_secret_key": {
+    "type": "string",
+    "description": "Hive V3 Playground Secret Key。",
+    "hint": "使用 Bearer 认证。仅用于本插件请求 Hive V3 AI-Generated & Deepfake Content Detection 接口。",
+    "obvious_hint": true,
+    "default": ""
+  },
+  "hive_v3_daily_request_limit": {
+    "type": "int",
+    "description": "Hive V3 每日全局请求上限。",
+    "hint": "按实际成功送检次数计数。静态图计 1 次，视频按成功送检帧数计数。",
+    "default": 100
+  },
+  "per_user_daily_limit": {
+    "type": "int",
+    "description": "普通用户每日可调用的核查额度。",
+    "hint": "管理员不受该限制，但仍受 Hive 全局日额度限制。",
+    "default": 10
+  },
+  "allow_video": {
+    "type": "bool",
+    "description": "是否允许核查视频。",
+    "hint": "启用后会按 1 FPS 本地抽帧，并逐帧请求 Hive。",
+    "default": true
+  },
+  "result_min_score": {
+    "type": "float",
+    "description": "保留来源归因结果的最小分数阈值。",
+    "hint": "低于该阈值的来源结果会被剔除以节省 token。",
+    "default": 0.05
+  },
+  "request_timeout_seconds": {
+    "type": "int",
+    "description": "Hive 请求超时时间（秒）。",
+    "default": 60
+  }
+}

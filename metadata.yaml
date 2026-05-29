@@ -1,0 +1,8 @@
+name: astrbot_plugin_hive_reality_check
+display_name: Hive Reality Check
+author: mo182
+desc: 为 LLM 提供 Hive V3 真实性核查工具，支持当前消息或引用消息中的静态图片与视频抽帧核查。
+short_desc: Hive V3 媒体真实性核查工具
+version: 0.1.0
+repo: https://github.com/mo182/astrbot_plugin_hive_reality_check
+astrbot_version: ">=4.9.2,<5"
