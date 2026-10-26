@@ -6,27 +6,45 @@
   },
   "hive_secret_key": {
     "type": "string",
-    "description": "Hive V3 Playground Secret Key。",
-    "hint": "使用 Bearer 认证。仅用于本插件请求 Hive V3 AI-Generated & Deepfake Content Detection 接口。",
+    "description": "Hive V3 Playground Secret Key（选填）。",
+    "hint": "使用 Bearer 认证。未配置时仅使用免费 API 通道；配置后免费 API 失败会自动回退到该付费接口。",
     "obvious_hint": true,
     "default": ""
+  },
+  "hive_free_api_enabled": {
+    "type": "bool",
+    "description": "是否优先使用免费 API（Hive 扩展接口）核查。",
+    "hint": "免费 API 无需 Key；请求失败（含限流 429）时自动回退到 Secret Key 付费接口。免费接口整段视频上限 30 秒。",
+    "default": true
+  },
+  "free_api_exempt_from_quota": {
+    "type": "bool",
+    "description": "免费 API 请求是否不计入每日限额。",
+    "hint": "开启后免费成功不计入 Hive 全局日额度与个人日额度；关闭后免费请求也消耗配额。",
+    "default": true
+  },
+  "require_authenticity_intent": {
+    "type": "bool",
+    "description": "是否要求用户输入包含真实性相关关键词才允许调用（文字门控）。",
+    "hint": "开启后仅当用户明确询问真实性/是否 AI 生成/deepfake 等时才调用工具；关闭后 LLM 可对任意媒体或文本直接核查。",
+    "default": true
   },
   "hive_v3_daily_request_limit": {
     "type": "int",
     "description": "Hive V3 每日全局请求上限。",
-    "hint": "按实际成功送检次数计数。静态图计 1 次，视频按成功送检帧数计数。",
+    "hint": "按实际成功送检次数计数。付费请求（及关闭豁免后的免费请求）计入；免费豁免开启时免费成功不计入。静态图计 1 次，付费视频每视频均匀抽 5 帧、按成功送检帧数计数（每视频至多 5 次）。",
     "default": 100
   },
   "per_user_daily_limit": {
     "type": "int",
     "description": "普通用户每日可调用的核查额度。",
-    "hint": "管理员不受该限制，但仍受 Hive 全局日额度限制。",
+    "hint": "管理员不受该限制，但仍受 Hive 全局日额度限制。免费豁免开启时免费成功不消耗该额度。",
     "default": 10
   },
   "allow_video": {
     "type": "bool",
     "description": "是否允许核查视频。",
-    "hint": "启用后会按 1 FPS 本地抽帧，并逐帧请求 Hive。",
+    "hint": "启用后：免费通道整段上传检测（≤30 秒，按秒返回概率，音频通道 data.audio 一并接入结果）；付费通道均匀抽 5 帧逐帧请求。",
     "default": true
   },
   "result_min_score": {

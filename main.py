@@ -11,6 +11,7 @@ from astrbot.api.star import Context, Star
 from astrbot.core.agent.run_context import ContextWrapper
 from astrbot.core.astr_agent_context import AstrAgentContext
 
+from .hive_free_api import HiveFreeClient
 from .hive_runtime import (
     HiveV3Client,
     MediaResolver,
@@ -30,10 +31,12 @@ class HiveRealityCheckTool(FunctionTool[AstrAgentContext]):
     plugin: object = None
     name: str = "check_media_authenticity_hive"
     description: str = (
-        "Check authenticity for one media item in the current chat context using Hive V3. "
+        "Check authenticity for one media item (or the current message text when no media is attached) "
+        "in the current chat context using Hive detection (free API first, paid V3 fallback). "
         "Call this tool only when the user is explicitly asking whether a current-message or quoted-message image/video is authentic, AI-generated, synthetic, fake, or deepfake. "
         "This tool does not accept file paths or URLs. It reads only the current AstrMessageEvent context. "
         "Supported: static jpg/jpeg/png/webp, and video mp4/webm/m4v when video checking is enabled. "
+        "Also supports plain-text AI detection (up to 2048 chars) when the current message has no media. "
         "Not supported: GIF, APNG, messages without media, empty quoted chains, and multi-media batch checks."
     )
     parameters: dict = Field(
@@ -80,6 +83,11 @@ class Main(Star):
                 secret_key=settings.hive_secret_key,
                 timeout_seconds=settings.request_timeout_seconds,
             ),
+            free_client_factory=lambda settings: (
+                HiveFreeClient(timeout_seconds=settings.request_timeout_seconds)
+                if settings.hive_free_api_enabled
+                else None
+            ),
         )
         tool = HiveRealityCheckTool(plugin=self)
         tool.active = bool(self.settings.enabled)
@@ -103,10 +111,15 @@ class Main(Star):
             elif isinstance(segment, Reply):
                 has_reply = True
         guidance = build_llm_tool_guidance_text(
-            enabled=self.settings.enabled and bool(self.settings.hive_secret_key.strip()),
+            enabled=self.settings.enabled and (
+                bool(self.settings.hive_secret_key.strip())
+                or self.settings.hive_free_api_enabled
+            ),
             allow_video=self.settings.allow_video,
             has_direct_image=has_direct_image,
             has_direct_video=has_direct_video,
             has_reply=has_reply,
+            text_detection_enabled=self.settings.hive_free_api_enabled,
+            require_authenticity_intent=self.settings.require_authenticity_intent,
         )
         req.system_prompt = f"{req.system_prompt or ''}\n{guidance}\n"

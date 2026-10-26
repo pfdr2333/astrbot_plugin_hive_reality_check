@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import math
 import os
 import struct
@@ -13,9 +14,20 @@ from typing import Any, Callable, Protocol, Sequence
 import cv2
 import httpx
 
+from .hive_free_api import (
+    FreeApiError,
+    normalize_free_audio_payload,
+    normalize_free_video_payload,
+)
+
+_logger = logging.getLogger("astrbot_plugin_hive_reality_check")
+
 HIVE_V3_ENDPOINT = (
     "https://api.thehive.ai/api/v3/hive/ai-generated-and-deepfake-content-detection"
 )
+
+# 免费接口整段上传视频的时长上限（扩展前端限制为 30 秒）。
+FREE_VIDEO_MAX_SECONDS = 30
 
 INTENT_KEYWORDS = (
     "核查事实",
@@ -83,6 +95,38 @@ class HiveClientProtocol(Protocol):
         ...
 
 
+class HiveFreeClientProtocol(Protocol):
+    """免费 API 客户端能力：图片字节、整段视频字节与文本三类检测。"""
+
+    async def analyze_media_bytes(
+        self,
+        media_bytes: bytes,
+        *,
+        content_type: str,
+    ) -> dict[str, Any]:
+        ...
+
+    async def analyze_video_bytes(
+        self,
+        media_bytes: bytes,
+        *,
+        content_type: str,
+    ) -> dict[str, Any]:
+        ...
+
+    async def analyze_text(self, text: str) -> dict[str, Any]:
+        ...
+
+
+class PaidQuotaExceededError(RuntimeError):
+    """付费请求（或计入配额模式的任何请求）前懒校验发现额度不足。"""
+
+    def __init__(self, kind: str, need: int) -> None:
+        super().__init__(f"{kind} quota insufficient for {need} requests")
+        self.kind = kind
+        self.need = need
+
+
 @dataclass(slots=True)
 class PluginSettings:
     enabled: bool = True
@@ -92,6 +136,9 @@ class PluginSettings:
     allow_video: bool = True
     result_min_score: float = 0.05
     request_timeout_seconds: int = 60
+    hive_free_api_enabled: bool = True
+    free_api_exempt_from_quota: bool = True
+    require_authenticity_intent: bool = True
 
 
 @dataclass(slots=True)
@@ -140,6 +187,9 @@ def normalize_settings(raw: dict[str, Any] | None) -> PluginSettings:
         allow_video=bool(raw.get("allow_video", True)),
         result_min_score=max(0.0, min(1.0, float(raw.get("result_min_score", 0.05)))),
         request_timeout_seconds=max(1, int(raw.get("request_timeout_seconds", 60))),
+        hive_free_api_enabled=bool(raw.get("hive_free_api_enabled", True)),
+        free_api_exempt_from_quota=bool(raw.get("free_api_exempt_from_quota", True)),
+        require_authenticity_intent=bool(raw.get("require_authenticity_intent", True)),
     )
 
 
@@ -290,6 +340,65 @@ def sample_video_frames(path: str) -> VideoSamplingResult:
     )
 
 
+PAID_VIDEO_FRAME_COUNT = 5
+
+
+def sample_video_frames_uniform(
+    path: str, *, frame_count: int = PAID_VIDEO_FRAME_COUNT
+) -> VideoSamplingResult:
+    """按固定帧数（默认 5 帧）在视频时长内均匀抽帧，供付费通道使用。
+
+    与逐秒采样不同：无论视频长短，都只送检固定帧数，便于把每次视频检测的
+    付费请求数控制在上限内（计入用户/Hive 配额）。
+    """
+    capture = cv2.VideoCapture(path)
+    if not capture.isOpened():
+        capture.release()
+        raise ValueError("无法打开视频文件进行抽帧。")
+    samples: list[VideoFrameSample] = []
+    failed_timestamps: list[float] = []
+    try:
+        fps = capture.get(cv2.CAP_PROP_FPS) or 0.0
+        frame_count_prop = capture.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0
+        if fps > 0 and frame_count_prop > 0:
+            duration_seconds = frame_count_prop / fps
+        else:
+            total = 0
+            while True:
+                ok, _ = capture.read()
+                if not ok:
+                    break
+                total += 1
+            if total <= 0:
+                raise ValueError("无法估算视频时长。")
+            duration_seconds = max(1.0, float(total))
+        count = max(1, int(frame_count))
+        for index in range(count):
+            timestamp = (index + 0.5) * duration_seconds / count
+            capture.set(cv2.CAP_PROP_POS_MSEC, timestamp * 1000.0)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                failed_timestamps.append(round(timestamp, ROUND_DIGITS))
+                continue
+            encoded_ok, encoded = cv2.imencode(".jpg", frame)
+            if not encoded_ok:
+                failed_timestamps.append(round(timestamp, ROUND_DIGITS))
+                continue
+            samples.append(
+                VideoFrameSample(
+                    timestamp_seconds=round(timestamp, ROUND_DIGITS),
+                    jpeg_bytes=encoded.tobytes(),
+                )
+            )
+    finally:
+        capture.release()
+    return VideoSamplingResult(
+        estimated_samples=count,
+        samples=samples,
+        failed_timestamps=failed_timestamps,
+    )
+
+
 def summarize_c2pa(payload: dict[str, Any]) -> dict[str, Any] | None:
     candidates = [
         payload.get("c2pa"),
@@ -416,6 +525,15 @@ def build_image_verdict(analysis: ImageAnalysis) -> str:
     if analysis.not_ai_generated >= 0.9 and analysis.ai_generated < 0.5:
         return "likely_authentic"
     return "uncertain"
+
+
+def build_text_verdict(analysis: ImageAnalysis) -> str:
+    """文本判定：免费文本接口只返回 ai_generated 单类概率，无 deepfake 维度。"""
+    if analysis.ai_generated >= VIDEO_AI_THRESHOLD:
+        return "likely_ai_generated_text"
+    if analysis.ai_generated < 0.5:
+        return "likely_human_text"
+    return "uncertain_text"
 
 
 def aggregate_video_results(
@@ -746,105 +864,231 @@ class RealityCheckService:
         quota_manager: QuotaManager,
         resolver: MediaResolver,
         hive_client_factory: Callable[[PluginSettings], HiveClientProtocol],
+        free_client_factory: (
+            Callable[[PluginSettings], HiveFreeClientProtocol | None] | None
+        ) = None,
         video_estimator: Callable[[str], int] = estimate_video_sample_count,
-        video_sampler: Callable[[str], VideoSamplingResult] = sample_video_frames,
+        video_sampler: Callable[[str], VideoSamplingResult] = sample_video_frames_uniform,
     ) -> None:
         self.settings = settings
         self.quota_manager = quota_manager
         self.resolver = resolver
         self.hive_client_factory = hive_client_factory
+        self.v3_client = hive_client_factory(settings)
+        self.free_client = free_client_factory(settings) if free_client_factory else None
         self.video_estimator = video_estimator
         self.video_sampler = video_sampler
+
+    def _has_key(self) -> bool:
+        return bool(self.settings.hive_secret_key.strip())
+
+    def _has_free(self) -> bool:
+        return self.settings.hive_free_api_enabled and self.free_client is not None
+
+    def _counts_toward_quota(self, *, backend: str) -> bool:
+        """请求是否消耗配额：付费请求必计；免费请求仅当豁免关闭时计。"""
+        return backend == "hive_v3" or not self.settings.free_api_exempt_from_quota
+
+    async def _ensure_paid_quota(
+        self,
+        platform_id: str,
+        sender_id: str,
+        is_admin: bool,
+        *,
+        need: int,
+    ) -> None:
+        hive_used = await self.quota_manager.get_hive_used()
+        hive_remaining = max(0, self.settings.hive_v3_daily_request_limit - hive_used)
+        if hive_remaining < need:
+            raise PaidQuotaExceededError("hive", need)
+        if not is_admin:
+            user_used = await self.quota_manager.get_user_used(platform_id, sender_id)
+            user_remaining = max(0, self.settings.per_user_daily_limit - user_used)
+            if user_remaining < need:
+                raise PaidQuotaExceededError("user", need)
+
+    async def _ensure_quota_or_error(
+        self,
+        platform_id: str,
+        sender_id: str,
+        is_admin: bool,
+        *,
+        need: int,
+        target_type: str,
+        source: str,
+    ) -> dict[str, Any] | None:
+        """额度足够返回 None，不足返回与现有文案一致的配额错误结果。"""
+        try:
+            await self._ensure_paid_quota(
+                platform_id, sender_id, is_admin, need=need
+            )
+        except PaidQuotaExceededError as exc:
+            return self._quota_error_result(
+                exc, target_type=target_type, source=source
+            )
+        return None
+
+    def _quota_error_result(
+        self,
+        exc: PaidQuotaExceededError,
+        *,
+        target_type: str,
+        source: str,
+    ) -> dict[str, Any]:
+        frame_hint = (
+            f"（视频按 {PAID_VIDEO_FRAME_COUNT} 帧均匀抽帧）" if target_type == "video" else ""
+        )
+        if exc.kind == "hive":
+            limit = self.settings.hive_v3_daily_request_limit
+            if exc.need <= 1:
+                return build_error_result(
+                    "hive_quota_exhausted",
+                    [f"Hive 全局日额度已耗尽（上限 {limit} 次/天），请明天再试。"],
+                    target_type=target_type, source=source,
+                )
+            return build_error_result(
+                "hive_quota_insufficient",
+                [
+                    f"Hive 全局剩余额度不足（上限 {limit} 次/天），"
+                    f"当前视频预计需要 {exc.need} 次请求{frame_hint}。"
+                ],
+                target_type=target_type, source=source,
+            )
+        limit = self.settings.per_user_daily_limit
+        if exc.need <= 1:
+            return build_error_result(
+                "user_quota_exhausted",
+                [f"你的今日核查额度已用完（上限 {limit} 次/天）。"],
+                target_type=target_type, source=source,
+            )
+        return build_error_result(
+            "user_quota_insufficient",
+            [
+                f"你的剩余额度不足（上限 {limit} 次/天），"
+                f"当前视频预计需要 {exc.need} 次请求{frame_hint}。"
+            ],
+            target_type=target_type, source=source,
+        )
 
     async def analyze_event(self, event: Any) -> dict[str, Any]:
         if not self.settings.enabled:
             return build_error_result("plugin_disabled", ["插件已禁用。"])
-        if not contains_authenticity_intent(getattr(event, "message_str", "")):
+        if (
+            self.settings.require_authenticity_intent
+            and not contains_authenticity_intent(getattr(event, "message_str", ""))
+        ):
             return build_error_result(
                 "tool_should_not_be_called",
                 [
                     "仅当用户明确询问真实性、是否 AI 生成、deepfake、真假或伪造时才应调用本工具。"
                 ],
             )
-        if not self.settings.hive_secret_key.strip():
-            return build_error_result("missing_hive_key", ["尚未配置 Hive Secret Key。"])
+        if not self._has_key() and not self._has_free():
+            return build_error_result(
+                "missing_hive_key",
+                ["尚未配置 Hive Secret Key，且免费 API 未启用。"],
+            )
+
+        is_admin = bool(event.is_admin())
+        platform_id = str(event.get_platform_id() or "unknown_platform")
+        sender_id = str(event.get_sender_id() or "unknown_user")
 
         target = await self.resolver.resolve_target(
             event.get_messages(),
             allow_video=self.settings.allow_video,
         )
         if isinstance(target, MediaResolutionError):
+            if target.code == "no_media":
+                text_result = await self._analyze_text(
+                    event, platform_id, sender_id, is_admin
+                )
+                if text_result is not None:
+                    return text_result
             return build_error_result(target.code, [target.message])
 
-        is_admin = bool(event.is_admin())
-        platform_id = str(event.get_platform_id() or "unknown_platform")
-        sender_id = str(event.get_sender_id() or "unknown_user")
-        hive_used = await self.quota_manager.get_hive_used()
-        hive_remaining = max(0, self.settings.hive_v3_daily_request_limit - hive_used)
-        user_used = await self.quota_manager.get_user_used(platform_id, sender_id)
-        user_remaining = max(0, self.settings.per_user_daily_limit - user_used)
-
         if target.target_type == "image":
-            if hive_remaining < 1:
-                return build_error_result(
-                    "hive_quota_exhausted",
-                    ["Hive 全局日额度已耗尽，请明天再试。"],
-                    target_type="image",
-                    source=target.source,
-                )
-            if not is_admin and user_remaining < 1:
-                return build_error_result(
-                    "user_quota_exhausted",
-                    ["你的今日核查额度已用完。"],
-                    target_type="image",
-                    source=target.source,
-                )
-            return await self._analyze_image(event, target, platform_id, sender_id, is_admin)
-
-        sample_count = self.video_estimator(target.file_path)
-        if hive_remaining < sample_count:
-            return build_error_result(
-                "hive_quota_insufficient",
-                [f"Hive 全局剩余额度不足，当前视频预计需要 {sample_count} 次请求。"],
-                target_type="video",
-                source=target.source,
+            return await self._analyze_image(
+                target, platform_id, sender_id, is_admin
             )
-        if not is_admin and user_remaining < sample_count:
-            return build_error_result(
-                "user_quota_insufficient",
-                [f"你的剩余额度不足，当前视频预计需要 {sample_count} 次请求。"],
-                target_type="video",
-                source=target.source,
-            )
-        return await self._analyze_video(event, target, platform_id, sender_id, is_admin)
+        return await self._analyze_video(
+            target, platform_id, sender_id, is_admin
+        )
 
     async def _analyze_image(
         self,
-        event: Any,
         target: ResolvedMediaTarget,
         platform_id: str,
         sender_id: str,
         is_admin: bool,
     ) -> dict[str, Any]:
-        del event
-        client = self.hive_client_factory(self.settings)
         with open(target.file_path, "rb") as file:
             media_bytes = file.read()
-        payload = await client.analyze_media_bytes(
-            media_bytes,
-            content_type=target.media_format,
+        mime = normalize_media_mime(target.media_format)
+
+        backend = "hive_v3"
+        if self._has_free():
+            if not self.settings.free_api_exempt_from_quota:
+                blocked = await self._ensure_quota_or_error(
+                    platform_id, sender_id, is_admin,
+                    need=1, target_type="image", source=target.source,
+                )
+                if blocked:
+                    return blocked
+            try:
+                payload = await self.free_client.analyze_media_bytes(
+                    media_bytes, content_type=mime,
+                )
+                backend = "free"
+            except Exception as exc:
+                _logger.warning("免费图片 API 检测失败，准备回退到付费接口：%s", exc)
+                if not self._has_key():
+                    return build_error_result(
+                        "free_api_failed",
+                        [f"免费图片 API 检测失败：{exc}"],
+                        target_type="image", source=target.source,
+                    )
+
+        if backend == "hive_v3":
+            blocked = await self._ensure_quota_or_error(
+                platform_id, sender_id, is_admin,
+                need=1, target_type="image", source=target.source,
+            )
+            if blocked:
+                return blocked
+            try:
+                payload = await self.v3_client.analyze_media_bytes(
+                    media_bytes, content_type=target.media_format,
+                )
+            except Exception as exc:
+                return build_error_result(
+                    "api_request_failed",
+                    [f"Hive 付费接口请求失败：{exc}"],
+                    target_type="image", source=target.source,
+                )
+
+        if self._counts_toward_quota(backend=backend):
+            await self.quota_manager.increment_hive(1)
+            if not is_admin:
+                await self.quota_manager.increment_user(platform_id, sender_id, 1)
+        analysis = summarize_image_payload(
+            payload, min_score=self.settings.result_min_score,
         )
-        await self.quota_manager.increment_hive(1)
-        if not is_admin:
-            await self.quota_manager.increment_user(platform_id, sender_id, 1)
-        analysis = summarize_image_payload(payload, min_score=self.settings.result_min_score)
         notes = [
             "图片阈值参考：ai_generated>=0.9 视为高度疑似 AI 生成；deepfake>=0.5 视为可能深度伪造。"
         ]
+        if backend == "free":
+            quota_hint = (
+                "未消耗 Secret Key 额度"
+                if self.settings.free_api_exempt_from_quota
+                else "计入每日限额"
+            )
+            notes.insert(0, f"本次检测使用免费 API 通道（{quota_hint}）。")
+        elif self._has_free():
+            notes.insert(0, "免费 API 请求失败，已自动回退到 Secret Key 付费接口。")
         result = {
             "target_type": "image",
             "source": target.source,
-            "quota_consumed": 1,
+            "quota_consumed": 1 if self._counts_toward_quota(backend=backend) else 0,
             "verdict": build_image_verdict(analysis),
             "ai_generated": analysis.ai_generated,
             "not_ai_generated": analysis.not_ai_generated,
@@ -858,25 +1102,152 @@ class RealityCheckService:
 
     async def _analyze_video(
         self,
-        event: Any,
         target: ResolvedMediaTarget,
         platform_id: str,
         sender_id: str,
         is_admin: bool,
     ) -> dict[str, Any]:
-        del event
-        client = self.hive_client_factory(self.settings)
+        free_available = self._has_free()
+        estimated_seconds = self.video_estimator(target.file_path)
+
+        if free_available and estimated_seconds <= FREE_VIDEO_MAX_SECONDS:
+            with open(target.file_path, "rb") as file:
+                media_bytes = file.read()
+            mime = normalize_media_mime(target.media_format)
+            if not self.settings.free_api_exempt_from_quota:
+                blocked = await self._ensure_quota_or_error(
+                    platform_id, sender_id, is_admin,
+                    need=1, target_type="video", source=target.source,
+                )
+                if blocked:
+                    return blocked
+            try:
+                raw_payload = await self.free_client.analyze_video_bytes(
+                    media_bytes, content_type=mime,
+                )
+                frame_payloads = normalize_free_video_payload(raw_payload)
+            except Exception as exc:
+                _logger.warning("免费视频 API 检测失败，准备回退到付费接口：%s", exc)
+                if not self._has_key():
+                    return build_error_result(
+                        "free_api_failed",
+                        [f"免费视频 API 检测失败：{exc}"],
+                        target_type="video", source=target.source,
+                    )
+            else:
+                counted = self._counts_toward_quota(backend="free")
+                if counted:
+                    await self.quota_manager.increment_hive(1)
+                    if not is_admin:
+                        await self.quota_manager.increment_user(
+                            platform_id, sender_id, 1
+                        )
+                aggregated = aggregate_video_results(
+                    frame_payloads,
+                    min_score=self.settings.result_min_score,
+                )
+                audio_scores = normalize_free_audio_payload(raw_payload)
+                audio_analysis: dict[str, Any] | None = None
+                if audio_scores:
+                    # 实测 data.audio 段内类别名与视频通道一致（ai_generated/not_ai_generated），
+                    # 同时兼容 *_audio 后缀变体，取两者最大值。
+                    ai_audio = round_score(
+                        max(
+                            audio_scores.get("ai_generated_audio", 0.0),
+                            audio_scores.get("ai_generated", 0.0),
+                        )
+                    )
+                    not_ai_audio = round_score(
+                        max(
+                            audio_scores.get("not_ai_generated_audio", 0.0),
+                            audio_scores.get("not_ai_generated", 0.0),
+                        )
+                    )
+                    if ai_audio >= VIDEO_AI_THRESHOLD:
+                        audio_verdict = "likely_ai_generated_audio"
+                    elif not_ai_audio >= VIDEO_AI_THRESHOLD:
+                        audio_verdict = "likely_authentic_audio"
+                    else:
+                        audio_verdict = "uncertain_audio"
+                    audio_analysis = {
+                        "ai_generated_audio": ai_audio,
+                        "not_ai_generated_audio": not_ai_audio,
+                        "verdict": audio_verdict,
+                    }
+                quota_hint = (
+                    "未消耗 Secret Key 额度"
+                    if self.settings.free_api_exempt_from_quota
+                    else "计入每日限额"
+                )
+                notes: list[str] = [
+                    f"本次视频使用免费 API 整段检测（{quota_hint}），接口按秒返回概率。",
+                    "任一采样点 ai_generated>=0.9 视为疑似 AI 视频。",
+                    "若 deepfake>=0.5 连续命中 2 个采样点，或命中占比>=5%，视为疑似 deepfake 视频。",
+                ]
+                if audio_analysis:
+                    notes.append(
+                        "音频通道（免费接口 data.audio）：该通道内 ai_generated>=0.9 "
+                        "视为疑似 AI 合成音频，not_ai_generated>=0.9 视为更可能为真实音频。"
+                    )
+                result = {
+                    "target_type": "video",
+                    "source": target.source,
+                    "quota_consumed": 1 if counted else 0,
+                    "verdict": aggregated["verdict"],
+                    "ai_generated": aggregated["ai_generated"],
+                    "not_ai_generated": aggregated["not_ai_generated"],
+                    "deepfake": aggregated["deepfake"],
+                    "top_sources": aggregated["top_sources"],
+                    "notes": notes,
+                    "frames_analyzed": aggregated["frames_analyzed"],
+                    "suspicious_timestamps": aggregated["suspicious_timestamps"],
+                    "ai_generated_video_suspected": aggregated[
+                        "ai_generated_video_suspected"
+                    ],
+                    "deepfake_video_suspected": aggregated[
+                        "deepfake_video_suspected"
+                    ],
+                }
+                if audio_analysis:
+                    result["audio_analysis"] = audio_analysis
+                if aggregated.get("c2pa"):
+                    result["c2pa"] = aggregated["c2pa"]
+                return result
+        elif free_available:
+            if not self._has_key():
+                return build_error_result(
+                    "video_too_long_for_free_api",
+                    [
+                        f"视频时长约 {estimated_seconds} 秒，超过免费接口 30 秒限制，且未配置 Secret Key 付费接口。"
+                    ],
+                    target_type="video", source=target.source,
+                )
+            _logger.info(
+                "视频时长约 %s 秒，超过 30 秒，跳过免费整段检测，使用付费接口。",
+                estimated_seconds,
+            )
+
+        blocked = await self._ensure_quota_or_error(
+            platform_id, sender_id, is_admin,
+            need=PAID_VIDEO_FRAME_COUNT, target_type="video", source=target.source,
+        )
+        if blocked:
+            return blocked
+        client = self.v3_client
         sampling = self.video_sampler(target.file_path)
         frame_payloads: list[tuple[float, dict[str, Any]]] = []
         request_failures: list[float] = []
+        first_failure_reason: str | None = None
         for sample in sampling.samples:
             try:
                 payload = await client.analyze_media_bytes(
                     sample.jpeg_bytes,
                     content_type="jpeg",
                 )
-            except Exception:
+            except Exception as exc:
                 request_failures.append(sample.timestamp_seconds)
+                if first_failure_reason is None:
+                    first_failure_reason = f"{type(exc).__name__}: {exc}"
                 continue
             frame_payloads.append((sample.timestamp_seconds, payload))
             await self.quota_manager.increment_hive(1)
@@ -884,10 +1255,13 @@ class RealityCheckService:
                 await self.quota_manager.increment_user(platform_id, sender_id, 1)
 
         if not frame_payloads:
+            failure_detail = (
+                f"（首次失败原因：{first_failure_reason}）" if first_failure_reason else ""
+            )
             return build_error_result(
                 "video_analysis_failed",
                 [
-                    "视频抽帧或送检未得到任何成功结果，请让用户改发静态图或更短的视频。"
+                    f"视频抽帧或送检未得到任何成功结果{failure_detail}，请让用户改发静态图或更短的视频。"
                 ],
                 target_type="video",
                 source=target.source,
@@ -898,7 +1272,7 @@ class RealityCheckService:
             min_score=self.settings.result_min_score,
         )
         notes: list[str] = [
-            "视频按 1 FPS 抽帧送检；任一帧 ai_generated>=0.9 视为疑似 AI 视频。",
+            f"视频按 {PAID_VIDEO_FRAME_COUNT} 帧均匀抽帧送检；任一帧 ai_generated>=0.9 视为疑似 AI 视频。",
             "若 deepfake>=0.5 连续命中 2 帧，或命中帧占比>=5%，视为疑似 deepfake 视频。",
         ]
         if sampling.failed_timestamps:
@@ -906,7 +1280,12 @@ class RealityCheckService:
                 f"有 {len(sampling.failed_timestamps)} 个抽样时间点抽帧失败，已自动跳过。"
             )
         if request_failures:
-            notes.append(f"有 {len(request_failures)} 帧请求 Hive 失败，结果为部分成功。")
+            notes.append(
+                f"有 {len(request_failures)} 帧请求付费接口失败，结果为部分成功"
+                + (f"（首次失败：{first_failure_reason}）。" if first_failure_reason else "。")
+            )
+        if free_available:
+            notes.insert(0, "免费视频 API 失败或超时长，已回退到付费 5 帧检测。")
         result = {
             "target_type": "video",
             "source": target.source,
@@ -926,6 +1305,73 @@ class RealityCheckService:
             result["c2pa"] = aggregated["c2pa"]
         return result
 
+    async def _analyze_text(
+        self,
+        event: Any,
+        platform_id: str,
+        sender_id: str,
+        is_admin: bool,
+    ) -> dict[str, Any] | None:
+        """消息无媒体时检测文本真实性；无文本返回 None 交由上层返回 no_media。"""
+        text = (getattr(event, "message_str", "") or "").strip()
+        if not text:
+            return None
+        if not self._has_free():
+            return build_error_result(
+                "text_detection_unavailable",
+                ["文本检测依赖免费 API 通道，请启用 hive_free_api_enabled 配置。"],
+                target_type="text", source="current_message",
+            )
+        if len(text) > 2048:
+            return build_error_result(
+                "text_too_long",
+                [f"文本长度 {len(text)} 超过 2048 字符限制，请分段核查。"],
+                target_type="text", source="current_message",
+            )
+        if not self.settings.free_api_exempt_from_quota:
+            blocked = await self._ensure_quota_or_error(
+                platform_id, sender_id, is_admin,
+                need=1, target_type="text", source="current_message",
+            )
+            if blocked:
+                return blocked
+        try:
+            payload = await self.free_client.analyze_text(text)
+        except Exception as exc:
+            return build_error_result(
+                "free_api_failed",
+                [f"免费文本 API 检测失败：{exc}"],
+                target_type="text", source="current_message",
+            )
+        counted = self._counts_toward_quota(backend="free")
+        if counted:
+            await self.quota_manager.increment_hive(1)
+            if not is_admin:
+                await self.quota_manager.increment_user(platform_id, sender_id, 1)
+        analysis = summarize_image_payload(
+            payload, min_score=self.settings.result_min_score,
+        )
+        quota_hint = (
+            "未消耗 Secret Key 额度"
+            if self.settings.free_api_exempt_from_quota
+            else "计入每日限额"
+        )
+        notes = [
+            f"本次文本检测使用免费 API 通道（{quota_hint}）。",
+            "文本阈值参考：ai_generated>=0.9 视为高度疑似 AI 生成；<0.5 视为更可能为人类撰写。",
+        ]
+        return {
+            "target_type": "text",
+            "source": "current_message",
+            "quota_consumed": 1 if counted else 0,
+            "verdict": build_text_verdict(analysis),
+            "ai_generated": analysis.ai_generated,
+            "not_ai_generated": analysis.not_ai_generated,
+            "deepfake": analysis.deepfake,
+            "top_sources": analysis.top_sources,
+            "notes": notes,
+        }
+
 
 def build_llm_tool_guidance_text(
     *,
@@ -934,6 +1380,8 @@ def build_llm_tool_guidance_text(
     has_direct_image: bool,
     has_direct_video: bool,
     has_reply: bool,
+    text_detection_enabled: bool,
+    require_authenticity_intent: bool,
 ) -> str:
     availability_parts: list[str] = []
     if has_direct_image:
@@ -946,13 +1394,22 @@ def build_llm_tool_guidance_text(
         availability_parts.append("当前消息未显式看到可用媒体候选")
     video_text = "允许视频核查" if allow_video else "视频核查已禁用"
     enabled_text = "工具可用" if enabled else "工具已禁用"
+    text_text = (
+        "消息无媒体时也可核查纯文本是否 AI 生成（≤2048 字符，仅免费通道）"
+        if text_detection_enabled
+        else "文本核查未启用"
+    )
+    gate_text = (
+        "仅当用户明确在问真实性、真假、是否 AI 生成、deepfake、伪造或合成时才可调用"
+        if require_authenticity_intent
+        else "只要用户消息包含媒体或文本即可直接调用核查"
+    )
     return (
         "关于工具 check_media_authenticity_hive："
-        f"{enabled_text}；{video_text}；"
-        "仅当用户明确在问真实性、真假、是否 AI 生成、deepfake、伪造或合成时才可调用；"
+        f"{enabled_text}；{video_text}；{text_text}；{gate_text}；"
         "仅核查当前消息直接携带的媒体，或当前消息引用消息中的媒体；"
         "仅支持静态 jpg/jpeg/png/webp，以及启用后的视频 mp4/webm/m4v；"
-        "不要用于 GIF、APNG、无媒体消息、引用链为空、或一次多媒体批量核查；"
+        "不要用于 GIF、APNG、引用链为空、或一次多媒体批量核查；"
         "若用户一次发多个媒体，请提示逐个核查。"
         "明确告知用户ai置信度和最可能的来源"
         f" 当前可见状态：{'；'.join(availability_parts)}。"
